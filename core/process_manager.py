@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import psutil
+from concurrent.futures import ThreadPoolExecutor
 
 # ── ptrace constants ───────────────────────────────────────────────────────────
 PTRACE_ATTACH   = 16
@@ -67,29 +68,30 @@ def _detect_arch(pid: int) -> int:
         return 64  # Default assumption for inaccessible processes
 
 
-def list_processes() -> list[ProcessInfo]:
-    """Return all running processes with architecture info."""
-    result: list[ProcessInfo] = []
-    for proc in psutil.process_iter(["pid", "name", "username", "cmdline"]):
+def _fetch_one(proc) -> Optional[ProcessInfo]:
+    try:
+        info = proc.info
+        pid  = info["pid"]
+        name = info["name"] or "<unknown>"
+        user = info["username"] or ""
         try:
-            info = proc.info
-            pid = info["pid"]
-            name = info["name"] or "<unknown>"
-            username = info["username"] or ""
-            try:
-                cmdline = " ".join(info["cmdline"] or [])
-            except (psutil.AccessDenied, TypeError):
-                cmdline = ""
-            arch = _detect_arch(pid)
-            result.append(ProcessInfo(
-                pid=pid,
-                name=name,
-                arch=arch if arch in (32, 64) else 64,
-                username=username,
-                cmdline=cmdline,
-            ))
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
+            cmdline = " ".join(info["cmdline"] or [])
+        except (psutil.AccessDenied, TypeError):
+            cmdline = ""
+        arch = _detect_arch(pid)
+        return ProcessInfo(pid=pid, name=name,
+                           arch=arch if arch in (32, 64) else 64,
+                           username=user, cmdline=cmdline)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return None
+
+
+def list_processes() -> list[ProcessInfo]:
+    """Return all running processes with architecture info (parallel ELF detection)."""
+    raw = list(psutil.process_iter(["pid", "name", "username", "cmdline"]))
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        infos = pool.map(_fetch_one, raw)
+    result = [p for p in infos if p is not None]
     result.sort(key=lambda p: p.name.lower())
     return result
 

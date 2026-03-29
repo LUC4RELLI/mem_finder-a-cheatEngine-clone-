@@ -60,10 +60,25 @@ def read_memory(pid: int, addr: int, size: int) -> Optional[bytes]:
     return _read_proc_mem(pid, addr, size)
 
 
+def _write_proc_mem(pid: int, addr: int, data: bytes) -> bool:
+    """Fallback: write via /proc/pid/mem using pwrite (requires root or ptrace_scope=0)."""
+    try:
+        fd = os.open(f"/proc/{pid}/mem", os.O_WRONLY)
+        try:
+            written = os.pwrite(fd, data, addr)
+            return written == len(data)
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+
+
 def write_memory(pid: int, addr: int, data: bytes) -> bool:
     """
     Write `data` into `pid`'s memory at `addr`.
-    Returns True on success.
+    Tries process_vm_writev first, then /proc/pid/mem.
+    Returns True on success, False on failure.
+    Requires: same UID + ptrace_scope=0, or root.
     """
     if not data:
         return True
@@ -78,7 +93,9 @@ def write_memory(pid: int, addr: int, data: bytes) -> bool:
                         ctypes.byref(local), ctypes.c_ulong(1),
                         ctypes.byref(remote), ctypes.c_ulong(1),
                         ctypes.c_ulong(0))
-    return ret == size
+    if ret == size:
+        return True
+    return _write_proc_mem(pid, addr, data)
 
 
 def read_memory_chunks(pid: int, addr: int, size: int,
@@ -120,9 +137,11 @@ class MemoryRegion:
         return self.end - self.start
 
     def __repr__(self) -> str:
-        flags = ("r" if self.readable else "-"
-                 + "w" if self.writable else "-"
-                 + "x" if self.executable else "-")
+        flags = (
+            ("r" if self.readable   else "-") +
+            ("w" if self.writable   else "-") +
+            ("x" if self.executable else "-")
+        )
         return (f"MemoryRegion(0x{self.start:016x}-0x{self.end:016x} "
                 f"{flags} {self.name!r})")
 
@@ -190,6 +209,29 @@ def get_module_bases(pid: int) -> dict[str, int]:
             if basename not in bases or r.start < bases[basename]:
                 bases[basename] = r.start
     return bases
+
+
+def make_module_resolver(pid: int):
+    """
+    Reads /proc/pid/maps once and returns a fast addr -> 'module+0xOFFSET' function.
+    Returns '' for anonymous/stack/heap regions.
+    """
+    maps = get_memory_maps(pid)
+    bases: dict[str, int] = {}
+    for r in maps:
+        if r.name and not r.name.startswith("["):
+            bn = os.path.basename(r.name)
+            if bn not in bases or r.start < bases[bn]:
+                bases[bn] = r.start
+
+    def resolve(addr: int) -> str:
+        for r in maps:
+            if r.start <= addr < r.end and r.name and not r.name.startswith("["):
+                bn  = os.path.basename(r.name)
+                base = bases.get(bn, r.start)
+                return f"{bn}+0x{addr - base:X}"
+        return ""
+    return resolve
 
 
 def address_to_module(pid: int, addr: int) -> Optional[tuple[str, int]]:

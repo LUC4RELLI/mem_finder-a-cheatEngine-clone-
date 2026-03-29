@@ -175,6 +175,13 @@ class App(ctk.CTk):
         self._tabs.set("Memory View")
         self.memory_view.navigate_to(addr)
 
+    @property
+    def addr_fmt(self) -> str:
+        """'08X' para processos 32-bit, '016X' para 64-bit."""
+        if self._process_info and self._process_info.arch == 32:
+            return "08X"
+        return "016X"
+
     def open_pointer_scanner_for(self, addr: int) -> None:
         """Switch to Pointer Scanner tab and pre-fill target address."""
         self._tabs.set("Pointer Scanner")

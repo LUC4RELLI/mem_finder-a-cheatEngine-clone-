@@ -11,7 +11,7 @@ from typing import Callable, Optional
 import customtkinter as ctk
 
 from core.data_types import DataType, format_value, pack, unpack, type_size, is_variable_length
-from core.memory_io import read_memory, write_memory
+from core.memory_io import read_memory, write_memory, make_module_resolver
 from core.memory_scanner import ScanEntry
 
 
@@ -24,6 +24,7 @@ class AddressRow:
         self.freeze_value: Optional[bytes] = None
         self._freeze_thread: Optional[threading.Thread] = None
         self._freeze_stop = threading.Event()
+        self._pid: int = 0
 
     def start_freeze(self, value_bytes: bytes) -> None:
         self.frozen = True
@@ -88,16 +89,17 @@ class AddressTableFrame(ctk.CTkFrame):
         frame = ctk.CTkFrame(self)
         frame.pack(fill="both", expand=True, padx=5, pady=(0, 5))
 
-        cols = ("address", "type", "value", "frozen", "description")
+        cols = ("address", "module", "type", "value", "frozen", "description")
         self._tree = ttk.Treeview(frame, columns=cols,
                                    show="headings", style="Addr.Treeview",
                                    selectmode="extended")
         for col, label, width in [
-            ("address",     "Address",     140),
-            ("type",        "Type",         90),
-            ("value",       "Value",        120),
-            ("frozen",      "Frozen",        60),
-            ("description", "Description",  180),
+            ("address",     "Address",     130),
+            ("module",      "Module",      170),
+            ("type",        "Type",         80),
+            ("value",       "Value",        110),
+            ("frozen",      "Frozen",        55),
+            ("description", "Description",  160),
         ]:
             self._tree.heading(col, text=label)
             self._tree.column(col, width=width, anchor="w")
@@ -129,14 +131,23 @@ class AddressTableFrame(ctk.CTkFrame):
 
     def add_entry(self, entry: ScanEntry, dtype: DataType,
                    description: str = "") -> None:
-        # Don't add duplicates
         if any(r.address == entry.address for r in self._rows):
             return
         row = AddressRow(entry, dtype, description)
         if self.app.pid:
             row.set_pid(self.app.pid)
         self._rows.append(row)
-        self._refresh_row(row)
+        # Insert immediately with placeholders; background refresh fills value+module
+        iid = hex(row.address)
+        addr_fmt = getattr(self.app, "addr_fmt", "016X")
+        self._tree.insert("", "end", iid=iid, values=(
+            f"0x{row.address:{addr_fmt}}",
+            "",
+            row.dtype.name,
+            "…",
+            "",
+            row.description,
+        ))
 
     def add_entries(self, entries: list[ScanEntry], dtype: DataType) -> None:
         for e in entries:
@@ -149,47 +160,73 @@ class AddressTableFrame(ctk.CTkFrame):
         self._tree.delete(*self._tree.get_children())
 
     def _refresh_row(self, row: AddressRow) -> None:
+        """Update an existing row's frozen tag and value in-place."""
         iid = hex(row.address)
-        pid = self.app.pid
-        value_str = "—"
-        if pid:
-            size = 64 if is_variable_length(row.dtype) else type_size(row.dtype)
-            data = read_memory(pid, row.address, size)
-            if data:
-                try:
-                    val = unpack(row.dtype, data)
-                    value_str = format_value(row.dtype, val)
-                except Exception:
-                    value_str = data.hex()
-
+        if not self._tree.exists(iid):
+            return
         frozen_str = "✓" if row.frozen else ""
-        vals = (
-            f"0x{row.address:016X}",
-            row.dtype.name,
-            value_str,
-            frozen_str,
-            row.description,
-        )
-        if self._tree.exists(iid):
-            self._tree.item(iid, values=vals)
+        cur = self._tree.item(iid, "values")
+        # Keep address, module, type; only update value, frozen, description
+        addr_str   = cur[0] if cur else f"0x{row.address:016X}"
+        module_str = cur[1] if cur else ""
+        value_str  = cur[3] if cur else "…"
+        self._tree.item(iid, values=(
+            addr_str, module_str, row.dtype.name,
+            value_str, frozen_str, row.description,
+        ))
+        if row.frozen:
+            self._tree.item(iid, tags=("frozen",))
         else:
-            self._tree.insert("", "end", iid=iid, values=vals)
-            if row.frozen:
-                self._tree.item(iid, tags=("frozen",))
+            self._tree.item(iid, tags=())
         self._tree.tag_configure("frozen", foreground="#44aaff")
 
     def _schedule_refresh(self) -> None:
-        self._do_refresh()
-        self._refresh_after_id = self.after(500, self._schedule_refresh)
+        self._do_bg_refresh()
 
-    def _do_refresh(self) -> None:
-        if not self.app.pid:
+    def _do_bg_refresh(self) -> None:
+        if not self.app.pid or not self._rows:
+            self.after(500, self._do_bg_refresh)
             return
-        for row in self._rows:
-            try:
-                self._refresh_row(row)
-            except Exception:
-                pass
+
+        rows = list(self._rows)
+        pid = self.app.pid
+
+        def _bg():
+            resolver = make_module_resolver(pid)
+            row_data = []
+            for row in rows:
+                size = 64 if is_variable_length(row.dtype) else type_size(row.dtype)
+                try:
+                    data = read_memory(pid, row.address, size)
+                    if data:
+                        val = unpack(row.dtype, data)
+                        value_str = format_value(row.dtype, val)
+                    else:
+                        value_str = "—"
+                except Exception:
+                    value_str = "—"
+                module_str = resolver(row.address)
+                row_data.append((row, value_str, module_str))
+            self.after(0, lambda d=row_data: self._apply_refresh(d))
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _apply_refresh(self, row_data: list) -> None:
+        addr_fmt = getattr(self.app, "addr_fmt", "016X")
+        for row, value_str, module_str in row_data:
+            iid = hex(row.address)
+            if not self._tree.exists(iid):
+                continue
+            frozen_str = "✓" if row.frozen else ""
+            self._tree.item(iid, values=(
+                f"0x{row.address:{addr_fmt}}",
+                module_str,
+                row.dtype.name,
+                value_str,
+                frozen_str,
+                row.description,
+            ))
+        self.after(500, self._do_bg_refresh)
 
     def _selected_row(self) -> Optional[AddressRow]:
         sel = self._tree.selection()
@@ -230,9 +267,19 @@ class AddressTableFrame(ctk.CTkFrame):
             return
         try:
             raw = pack(row.dtype, new_val)
-            write_memory(self.app.pid, row.address, raw)
-            if row.frozen:
-                row.freeze_value = raw
+            ok = write_memory(self.app.pid, row.address, raw)
+            if ok:
+                if row.frozen:
+                    row.freeze_value = raw
+            else:
+                from tkinter import messagebox
+                messagebox.showerror(
+                    "Write Failed",
+                    f"Could not write to 0x{row.address:X}.\n\n"
+                    "Run the app with sudo, or allow ptrace:\n"
+                    "  echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope",
+                    parent=self,
+                )
         except Exception as e:
             from tkinter import messagebox
             messagebox.showerror("Error", str(e), parent=self)

@@ -127,21 +127,35 @@ def _apply_mask(arr: np.ndarray, mode: ScanMode,
 
 def _scan_region_numpy(data: bytes, base_addr: int, dtype: DataType,
                        mode: ScanMode, val1: Any, val2: Any = None,
+                       aligned: bool = True,
                        ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Scan a bytes buffer at EVERY byte offset and return
-    (address_array, value_array) as numpy arrays.
+    Scan a bytes buffer and return (address_array, value_array).
+
+    aligned=True  (default): scan only at naturally-aligned offsets, i.e. the
+                             starting offset within the chunk that keeps addresses
+                             as multiples of item_size.  Matches Cheat Engine's
+                             default behaviour and avoids 4x duplicate candidates.
+    aligned=False:           scan at every byte offset (slower, more false positives).
     """
-    np_dt    = numpy_dtype(dtype)
+    np_dt     = numpy_dtype(dtype)
     item_size = type_size(dtype)
     if len(data) < item_size:
         return np.empty(0, np.uint64), np.empty(0, np_dt)
 
     mv = memoryview(data)
+
+    if aligned:
+        # Only the single shift that makes base_addr+shift a multiple of item_size
+        first_aligned = (item_size - (base_addr % item_size)) % item_size
+        shifts = [first_aligned]
+    else:
+        shifts = list(range(item_size))
+
     all_addrs:  list[np.ndarray] = []
     all_values: list[np.ndarray] = []
 
-    for shift in range(item_size):
+    for shift in shifts:
         available = len(data) - shift
         usable    = (available // item_size) * item_size
         if usable <= 0:
@@ -176,14 +190,28 @@ def _scan_region_bytes(data: bytes, base_addr: int,
 
 # ── first_scan ────────────────────────────────────────────────────────────────
 
+MAX_REGION_SIZE = 256 * 1024 * 1024   # skip regions > 256 MB (textures/assets)
+
+
 def first_scan(pid: int, dtype: DataType,
                mode: ScanMode, value: Any, value2: Any = None,
-               progress_callback: Optional[Callable] = None) -> ScanState:
+               progress_callback: Optional[Callable] = None,
+               aligned: bool = True,
+               writable_only: bool = True) -> ScanState:
     """
     Full-memory first scan.  Reads every readable region and collects all
     addresses matching (mode, value).  Capped at MAX_RESULTS (2 000 000).
+
+    writable_only=True (default): skips read-only regions (code, assets,
+    memory-mapped game files).  This is ~10-100x faster on large games.
     """
-    regions    = get_readable_regions(pid)
+    all_regions = get_readable_regions(pid)
+    # Skip huge regions (game textures, asset files) and optionally read-only
+    regions = [
+        r for r in all_regions
+        if r.size <= MAX_REGION_SIZE
+        and (not writable_only or r.writable)
+    ]
     total_bytes = sum(r.size for r in regions)
     done_bytes  = 0
     item_size   = type_size(dtype)
@@ -225,7 +253,8 @@ def first_scan(pid: int, dtype: DataType,
             data = read_memory(pid, region.start + offset, to_read)
             if data and len(data) >= item_size:
                 addrs, values = _scan_region_numpy(
-                    data, region.start + offset, dtype, mode, value, value2)
+                    data, region.start + offset, dtype, mode, value, value2,
+                    aligned=aligned)
                 if len(addrs):
                     remaining = MAX_RESULTS - total_found
                     addr_chunks.append(addrs[:remaining])

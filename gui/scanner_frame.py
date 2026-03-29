@@ -10,9 +10,9 @@ from typing import Optional
 import customtkinter as ctk
 
 from core.data_types import DataType, display_name, ALL_TYPES, unpack, format_value, type_size, is_variable_length
-from core.memory_io import read_memory
+from core.memory_io import read_memory, make_module_resolver
 from core.memory_scanner import (
-    ScanMode, ScanState, ScanEntry, first_scan, next_scan,
+    ScanMode, ScanState, ScanEntry, first_scan, next_scan, MAX_RESULTS,
 )
 
 
@@ -54,6 +54,7 @@ class ScannerFrame(ctk.CTkFrame):
         super().__init__(parent, **kwargs)
         self.app = app
         self._scan_state: Optional[ScanState] = None
+        self._prev_scan_state: Optional[ScanState] = None
         self._scanning = False
         self._build_ui()
         self._schedule_live_refresh()
@@ -113,13 +114,29 @@ class ScannerFrame(ctk.CTkFrame):
             row3, text="New Scan", width=110,
             command=self._do_new_scan, state="disabled",
             fg_color="#555555")
-        self._new_btn.pack(side="left", padx=(0, 12))
+        self._new_btn.pack(side="left", padx=(0, 6))
+
+        self._undo_btn = ctk.CTkButton(
+            row3, text="Undo Scan", width=100,
+            command=self._undo_scan, state="disabled",
+            fg_color="#553355")
+        self._undo_btn.pack(side="left", padx=(0, 12))
 
         self._add_all_btn = ctk.CTkButton(
             row3, text="Add All to Table", width=130,
             command=self._add_all_to_table, state="disabled",
             fg_color="#2a6099")
-        self._add_all_btn.pack(side="left")
+        self._add_all_btn.pack(side="left", padx=(0, 12))
+
+        self._aligned_var = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(row3, text="Aligned",
+                        variable=self._aligned_var,
+                        width=90).pack(side="left")
+
+        self._writable_var = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(row3, text="Writable only",
+                        variable=self._writable_var,
+                        width=120).pack(side="left", padx=(6, 0))
 
         self._progress = ctk.CTkProgressBar(self, mode="determinate")
         self._progress.pack(fill="x", padx=8, pady=(0, 4))
@@ -143,12 +160,14 @@ class ScannerFrame(ctk.CTkFrame):
         res_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
         self._results = ttk.Treeview(
-            res_frame, columns=("address", "value"),
+            res_frame, columns=("address", "module", "value"),
             show="headings", style="Scan.Treeview", selectmode="extended")
         self._results.heading("address", text="Address")
-        self._results.heading("value",   text="Current Value  ↺")
-        self._results.column("address", width=160, anchor="w")
-        self._results.column("value",   width=140, anchor="w")
+        self._results.heading("module",  text="Module")
+        self._results.heading("value",   text="Value  ↺")
+        self._results.column("address", width=140, anchor="w")
+        self._results.column("module",  width=190, anchor="w")
+        self._results.column("value",   width=110, anchor="w")
 
         vsb = ttk.Scrollbar(res_frame, orient="vertical",
                              command=self._results.yview)
@@ -170,32 +189,45 @@ class ScannerFrame(ctk.CTkFrame):
     # ── Live value refresh ────────────────────────────────────────────────────
 
     def _schedule_live_refresh(self) -> None:
-        self._live_refresh()
-        self.after(_LIVE_REFRESH_MS, self._schedule_live_refresh)
-
-    def _live_refresh(self) -> None:
-        """Re-read current values from memory for all displayed entries."""
         if self._scanning or not self.app.pid or not self._scan_state:
+            self.after(_LIVE_REFRESH_MS, self._schedule_live_refresh)
             return
+
+        iids = list(self._results.get_children())
+        if not iids:
+            self.after(_LIVE_REFRESH_MS, self._schedule_live_refresh)
+            return
+
         pid = self.app.pid
         dtype = self._scan_state.dtype
         item_size = 64 if is_variable_length(dtype) else type_size(dtype)
 
-        # Only refresh entries currently in the treeview
-        for iid in self._results.get_children():
+        def _bg():
+            updates = []
+            for iid in iids:
+                try:
+                    addr = int(iid, 16)
+                    data = read_memory(pid, addr, item_size)
+                    if data and len(data) == item_size:
+                        val_str = format_value(dtype, unpack(dtype, data))
+                    else:
+                        val_str = "??"
+                    updates.append((iid, val_str))
+                except Exception:
+                    pass
+            self.after(0, lambda u=updates: self._apply_live_updates(u))
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _apply_live_updates(self, updates: list) -> None:
+        for iid, val_str in updates:
             try:
-                addr = int(iid, 16)
-                data = read_memory(pid, addr, item_size)
-                if data and len(data) == item_size:
-                    val = unpack(dtype, data)
-                    val_str = format_value(dtype, val)
-                else:
-                    val_str = "??"
                 cur_vals = self._results.item(iid, "values")
-                if cur_vals and cur_vals[1] != val_str:
-                    self._results.item(iid, values=(cur_vals[0], val_str))
+                if cur_vals and len(cur_vals) >= 3 and cur_vals[2] != val_str:
+                    self._results.item(iid, values=(cur_vals[0], cur_vals[1], val_str))
             except Exception:
                 pass
+        self.after(_LIVE_REFRESH_MS, self._schedule_live_refresh)
 
     # ── Mode/type helpers ─────────────────────────────────────────────────────
 
@@ -239,21 +271,39 @@ class ScannerFrame(ctk.CTkFrame):
             messagebox.showwarning("No Process", "Attach to a process first.", parent=self)
             return
         self._scan_state = None
+        self._prev_scan_state = None
         self._results.delete(*self._results.get_children())
         self._do_scan(first=True)
 
     def _do_next_scan(self) -> None:
         if not self._scan_state:
             return
+        # Save current state so Undo can restore it
+        self._prev_scan_state = self._scan_state
         self._do_scan(first=False)
+
+    def _undo_scan(self) -> None:
+        if self._prev_scan_state is None:
+            return
+        self._scan_state = self._prev_scan_state
+        self._prev_scan_state = None
+        self._populate_results(self._scan_state)
+        count = self._scan_state.count
+        self._status.configure(
+            text=f"Undone — {count:,} addresses (scan #{self._scan_state.scan_count})")
+        self._progress.set(1.0)
+        self._undo_btn.configure(state="disabled")
+        self._finish_scan(success=True)
 
     def _do_new_scan(self) -> None:
         self._scan_state = None
+        self._prev_scan_state = None
         self._results.delete(*self._results.get_children())
         self._status.configure(text="New scan ready.")
         self._progress.set(0)
         self._next_btn.configure(state="disabled")
         self._new_btn.configure(state="disabled")
+        self._undo_btn.configure(state="disabled")
         self._add_all_btn.configure(state="disabled")
         self._mode_menu.configure(values=[_SCAN_MODE_LABELS[m] for m in _FIRST_SCAN_MODES])
         self._mode_var.set(_SCAN_MODE_LABELS[ScanMode.EXACT])
@@ -295,6 +345,8 @@ class ScannerFrame(ctk.CTkFrame):
 
         # Snapshot current scan state for the worker thread
         current_state = self._scan_state
+        aligned = self._aligned_var.get()
+        writable_only = self._writable_var.get()
 
         def progress_cb(done, total):
             if total > 0:
@@ -306,6 +358,8 @@ class ScannerFrame(ctk.CTkFrame):
                     result = first_scan(
                         self.app.pid, dtype, mode, val1, val2,
                         progress_callback=progress_cb,
+                        aligned=aligned,
+                        writable_only=writable_only,
                     )
                 else:
                     result = next_scan(
@@ -335,7 +389,7 @@ class ScannerFrame(ctk.CTkFrame):
         self._scan_state = state
         self._populate_results(state)
         count = state.count
-        cap = " (capped at 50k)" if count >= 50000 else ""
+        cap = f" (capped at {MAX_RESULTS:,})" if count >= MAX_RESULTS else ""
         showing = min(count, _DISPLAY_LIMIT)
         self._status.configure(
             text=f"Found {count:,} addresses{cap} — showing {showing:,} — scan #{state.scan_count}")
@@ -350,11 +404,14 @@ class ScannerFrame(ctk.CTkFrame):
             self._first_btn.configure(state="disabled")
             count = self._scan_state.count
             self._add_all_btn.configure(state="normal" if count > 0 else "disabled")
+            self._undo_btn.configure(
+                state="normal" if self._prev_scan_state is not None else "disabled")
             # Enable rescan modes
             self._mode_menu.configure(values=[_SCAN_MODE_LABELS[m] for m in _NEXT_SCAN_MODES])
         else:
             self._first_btn.configure(state="normal")
             self._next_btn.configure(state="disabled")
+            self._undo_btn.configure(state="disabled")
 
     def _populate_results(self, state: ScanState) -> None:
         """
@@ -366,7 +423,9 @@ class ScannerFrame(ctk.CTkFrame):
         dtype = state.dtype
         item_size = 64 if is_variable_length(dtype) else type_size(dtype)
 
-        for entry in state.entries[:_DISPLAY_LIMIT]:
+        addr_fmt = getattr(self.app, "addr_fmt", "016X")
+        resolver = make_module_resolver(pid) if pid else (lambda a: "")
+        for entry in state.get_entries(_DISPLAY_LIMIT):
             # Read CURRENT value from memory (not stale previous_bytes)
             val_str = "??"
             data = read_memory(pid, entry.address, item_size) if pid else None
@@ -382,10 +441,11 @@ class ScannerFrame(ctk.CTkFrame):
                 except Exception:
                     val_str = entry.previous_bytes.hex()
 
+            module_str = resolver(entry.address)
             self._results.insert(
                 "", "end",
                 iid=hex(entry.address),
-                values=(f"0x{entry.address:016X}", val_str),
+                values=(f"0x{entry.address:{addr_fmt}}", module_str, val_str),
             )
 
     # ── Add to table ──────────────────────────────────────────────────────────
